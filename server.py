@@ -10,7 +10,7 @@ import json
 import datetime
 from mcp.server.mcpserver import MCPServer
 from starlette.applications import Starlette
-from starlette.routing import Route, Mount
+from starlette.routing import Route
 from starlette.responses import JSONResponse, Response
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -605,6 +605,18 @@ def add_keywords_to_ad_group(campaign_name: str, ad_group_name: str,
                  campaign_name, ad_group_name, keywords)
 
 
+# ── Health routes (registered before streamable_http_app is called) ───────────
+
+@mcp.custom_route("/", methods=["GET"])
+async def root(request):
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    return JSONResponse({"status": "ok"})
+
+
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
@@ -623,19 +635,13 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
 
 
 # ── Starlette app ─────────────────────────────────────────────────────────────
+# Use streamable_http_app directly (preserves its lifespan/session manager).
+# host="0.0.0.0" disables localhost-only DNS rebinding protection so Render works.
 
-_mcp_asgi = mcp.streamable_http_app(streamable_http_path="/mcp")
-
-
-async def health(request):
-    return JSONResponse({"status": "ok"})
-
-
-starlette_app = Starlette(routes=[
-    Route("/",       endpoint=health),
-    Route("/health", endpoint=health),
-    Mount("/",       app=_mcp_asgi),
-])
+starlette_app = mcp.streamable_http_app(
+    streamable_http_path="/mcp",
+    host="0.0.0.0",
+)
 
 starlette_app.add_middleware(TokenAuthMiddleware)
 starlette_app.add_middleware(
