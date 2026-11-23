@@ -8,6 +8,7 @@ Uses mcp 2.x Streamable HTTP transport for claude.ai compatibility.
 import os
 import json
 import datetime
+from google.api_core import protobuf_helpers
 from mcp.server.mcpserver import MCPServer
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -103,7 +104,7 @@ def tool_get_campaigns() -> str:
         SELECT campaign.id, campaign.name, campaign.status,
                campaign.advertising_channel_type,
                campaign_budget.amount_micros,
-               campaign.start_date, campaign.end_date
+               campaign.start_date_time, campaign.end_date_time
         FROM campaign
         ORDER BY campaign.name
     """)
@@ -113,8 +114,8 @@ def tool_get_campaigns() -> str:
         "status":           r.campaign.status.name,
         "type":             r.campaign.advertising_channel_type.name,
         "daily_budget_gbp": micros(r.campaign_budget.amount_micros),
-        "start":            r.campaign.start_date,
-        "end":              r.campaign.end_date or "ongoing",
+        "start":            r.campaign.start_date_time,
+        "end":              r.campaign.end_date_time or "ongoing",
     } for r in rows]
     return json.dumps(results, indent=2)
 
@@ -244,8 +245,8 @@ def tool_update_campaign_budget(campaign_name: str,
     budget.resource_name = rows[0].campaign_budget.resource_name
     budget.amount_micros = int(new_daily_budget_gbp * 1_000_000)
     op = client.get_type("CampaignBudgetOperation")
-    op.update.CopyFrom(budget)
-    op.update_mask.paths.append("amount_micros")
+    op.update = budget
+    op.update_mask = protobuf_helpers.field_mask(None, budget._pb)
     service.mutate_campaign_budgets(customer_id=CUSTOMER_ID, operations=[op])
     return json.dumps({
         "success":         True,
@@ -272,10 +273,10 @@ def tool_set_campaign_status(campaign_name: str, status: str) -> str:
     campaign = client.get_type("Campaign")
     campaign.resource_name = rows[0].campaign.resource_name
     campaign.status = getattr(
-        client.enums.CampaignStatusEnum.CampaignStatus, status)
+        client.enums.CampaignStatusEnum, status)
     op = client.get_type("CampaignOperation")
-    op.update.CopyFrom(campaign)
-    op.update_mask.paths.append("status")
+    op.update = campaign
+    op.update_mask = protobuf_helpers.field_mask(None, campaign._pb)
     service.mutate_campaigns(customer_id=CUSTOMER_ID, operations=[op])
     return json.dumps({
         "success":    True,
