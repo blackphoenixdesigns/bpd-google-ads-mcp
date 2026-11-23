@@ -506,6 +506,149 @@ def tool_add_keywords_to_ad_group(campaign_name: str,
     })
 
 
+def tool_get_listing_groups(campaign_name: str) -> str:
+    rows = run_query(f"""
+        SELECT
+            ad_group_criterion.criterion_id,
+            ad_group_criterion.resource_name,
+            ad_group_criterion.status,
+            ad_group_criterion.negative,
+            ad_group_criterion.cpc_bid_micros,
+            ad_group_criterion.listing_group.type,
+            ad_group_criterion.listing_group.case_value.product_type.value,
+            ad_group_criterion.listing_group.case_value.product_type.level,
+            ad_group_criterion.listing_group.case_value.product_brand.value,
+            ad_group_criterion.listing_group.case_value.product_item_id.value,
+            ad_group_criterion.listing_group.parent_ad_group_criterion,
+            ad_group.name,
+            ad_group.resource_name
+        FROM ad_group_criterion
+        WHERE campaign.name = '{campaign_name}'
+          AND ad_group_criterion.type = LISTING_GROUP
+        ORDER BY ad_group_criterion.criterion_id
+    """)
+    results = []
+    for r in rows:
+        agc = r.ad_group_criterion
+        lg  = agc.listing_group
+        cv  = lg.case_value
+        if cv.product_type.value:
+            case_value = {"dim": "product_type",
+                          "level": cv.product_type.level.name,
+                          "value": cv.product_type.value}
+        elif cv.product_brand.value:
+            case_value = {"dim": "brand", "value": cv.product_brand.value}
+        elif cv.product_item_id.value:
+            case_value = {"dim": "item_id", "value": cv.product_item_id.value}
+        else:
+            case_value = None  # root / "everything else" node
+        results.append({
+            "criterion_id": agc.criterion_id,
+            "ad_group":     r.ad_group.name,
+            "node_type":    lg.type_.name,
+            "case_value":   case_value,
+            "excluded":     agc.negative,
+            "status":       agc.status.name,
+            "cpc_bid_gbp":  micros(agc.cpc_bid_micros),
+        })
+    return json.dumps(results, indent=2)
+
+
+def tool_exclude_listing_group(campaign_name: str, criterion_id: int) -> str:
+    rows = run_query(f"""
+        SELECT
+            ad_group_criterion.resource_name,
+            ad_group_criterion.negative,
+            ad_group_criterion.listing_group.type,
+            ad_group_criterion.listing_group.case_value.product_type.value,
+            ad_group_criterion.listing_group.case_value.product_type.level,
+            ad_group_criterion.listing_group.case_value.product_brand.value,
+            ad_group_criterion.listing_group.case_value.product_item_id.value,
+            ad_group_criterion.listing_group.parent_ad_group_criterion,
+            ad_group.resource_name
+        FROM ad_group_criterion
+        WHERE campaign.name = '{campaign_name}'
+          AND ad_group_criterion.criterion_id = {criterion_id}
+          AND ad_group_criterion.type = LISTING_GROUP
+        LIMIT 1
+    """)
+    if not rows:
+        return json.dumps({"error": f"Listing group {criterion_id} not found in '{campaign_name}'"})
+
+    agc = rows[0].ad_group_criterion
+    if agc.negative:
+        return json.dumps({"message": "Already excluded", "criterion_id": criterion_id})
+
+    client  = ads_client()
+    service = client.get_service("AdGroupCriterionService")
+    ops     = []
+
+    remove_op        = client.get_type("AdGroupCriterionOperation")
+    remove_op.remove = agc.resource_name
+    ops.append(remove_op)
+
+    lg        = agc.listing_group
+    criterion = client.get_type("AdGroupCriterion")
+    criterion.ad_group = rows[0].ad_group.resource_name
+    criterion.negative = True
+    criterion.status   = client.enums.AdGroupCriterionStatusEnum.ENABLED
+    criterion.listing_group.type_ = lg.type_
+    criterion.listing_group.parent_ad_group_criterion = lg.parent_ad_group_criterion
+
+    cv = lg.case_value
+    if cv.product_type.value:
+        criterion.listing_group.case_value.product_type.value = cv.product_type.value
+        criterion.listing_group.case_value.product_type.level = cv.product_type.level
+    elif cv.product_brand.value:
+        criterion.listing_group.case_value.product_brand.value = cv.product_brand.value
+    elif cv.product_item_id.value:
+        criterion.listing_group.case_value.product_item_id.value = cv.product_item_id.value
+
+    create_op        = client.get_type("AdGroupCriterionOperation")
+    create_op.create = criterion
+    ops.append(create_op)
+
+    service.mutate_ad_group_criteria(customer_id=CUSTOMER_ID, operations=ops)
+    return json.dumps({"success": True, "criterion_id": criterion_id, "action": "excluded"})
+
+
+def tool_update_listing_group_bid(campaign_name: str,
+                                   criterion_id: int,
+                                   cpc_bid_gbp: float) -> str:
+    rows = run_query(f"""
+        SELECT ad_group_criterion.resource_name,
+               ad_group_criterion.cpc_bid_micros,
+               ad_group_criterion.negative
+        FROM ad_group_criterion
+        WHERE campaign.name = '{campaign_name}'
+          AND ad_group_criterion.criterion_id = {criterion_id}
+          AND ad_group_criterion.type = LISTING_GROUP
+        LIMIT 1
+    """)
+    if not rows:
+        return json.dumps({"error": f"Listing group {criterion_id} not found in '{campaign_name}'"})
+
+    agc = rows[0].ad_group_criterion
+    if agc.negative:
+        return json.dumps({"error": "Cannot set a bid on an excluded listing group"})
+
+    client    = ads_client()
+    service   = client.get_service("AdGroupCriterionService")
+    criterion = client.get_type("AdGroupCriterion")
+    criterion.resource_name  = agc.resource_name
+    criterion.cpc_bid_micros = int(cpc_bid_gbp * 1_000_000)
+    op             = client.get_type("AdGroupCriterionOperation")
+    op.update      = criterion
+    op.update_mask = protobuf_helpers.field_mask(None, criterion._pb)
+    service.mutate_ad_group_criteria(customer_id=CUSTOMER_ID, operations=[op])
+    return json.dumps({
+        "success":         True,
+        "criterion_id":    criterion_id,
+        "old_cpc_bid_gbp": micros(agc.cpc_bid_micros),
+        "new_cpc_bid_gbp": cpc_bid_gbp,
+    })
+
+
 # ── MCP Server (mcp 2.x) ─────────────────────────────────────────────────────
 
 mcp = MCPServer("bpd-google-ads")
@@ -604,6 +747,25 @@ def add_keywords_to_ad_group(campaign_name: str, ad_group_name: str,
     """Add keywords to an ad group. Each keyword: {text, match_type (BROAD/PHRASE/EXACT), cpc_bid_gbp (optional)}."""
     return _safe(tool_add_keywords_to_ad_group,
                  campaign_name, ad_group_name, keywords)
+
+
+@mcp.tool()
+def get_listing_groups(campaign_name: str) -> str:
+    """List all listing group criteria in a Shopping campaign. Shows criterion IDs, product dimensions, bids and exclusions."""
+    return _safe(tool_get_listing_groups, campaign_name)
+
+
+@mcp.tool()
+def exclude_listing_group(campaign_name: str, criterion_id: int) -> str:
+    """Exclude a listing group from a Shopping campaign by criterion ID. Use get_listing_groups first to find the ID."""
+    return _safe(tool_exclude_listing_group, campaign_name, criterion_id)
+
+
+@mcp.tool()
+def update_listing_group_bid(campaign_name: str, criterion_id: int,
+                              cpc_bid_gbp: float) -> str:
+    """Update the CPC bid on a listing group unit in a Shopping campaign. Use get_listing_groups first to find the ID."""
+    return _safe(tool_update_listing_group_bid, campaign_name, criterion_id, cpc_bid_gbp)
 
 
 # ── Health routes (registered before streamable_http_app is called) ───────────
