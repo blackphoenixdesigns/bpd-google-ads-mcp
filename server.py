@@ -12,11 +12,15 @@ from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.middleware.cors import CORSMiddleware
 import uvicorn
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
+
+# ── Auth token ────────────────────────────────────────────────────────────────
+
+AUTH_TOKEN = os.environ["MCP_AUTH_TOKEN"]
 
 # ── Credentials from environment variables ────────────────────────────────────
 
@@ -410,6 +414,8 @@ sse = SseServerTransport("/messages/")
 
 
 async def handle_sse(request):
+    if request.query_params.get("token") != AUTH_TOKEN:
+        return Response("Unauthorized", status_code=401)
     async with sse.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
