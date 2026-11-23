@@ -2,18 +2,18 @@
 """
 Black Phoenix Designs — Google Ads MCP Server
 Credentials are loaded from environment variables (set in Render dashboard).
+Uses mcp 2.x Streamable HTTP transport for claude.ai compatibility.
 """
 
 import os
 import json
 import datetime
-from mcp.server import Server
-from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent
+from mcp.server.mcpserver import MCPServer
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse, Response
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
@@ -285,8 +285,7 @@ def tool_set_campaign_status(campaign_name: str, status: str) -> str:
     })
 
 
-def tool_add_negative_keywords(campaign_name: str,
-                                keywords: list) -> str:
+def tool_add_negative_keywords(campaign_name: str, keywords: list) -> str:
     rows = run_query(f"""
         SELECT campaign.resource_name
         FROM campaign
@@ -316,10 +315,8 @@ def tool_add_negative_keywords(campaign_name: str,
 def tool_create_search_campaign(name: str,
                                 daily_budget_gbp: float,
                                 start_paused: bool = True) -> str:
-    """Create a Search campaign with a standard budget. Returns campaign resource name."""
     client = ads_client()
 
-    # 1. Create budget
     budget_svc = client.get_service("CampaignBudgetService")
     budget     = client.get_type("CampaignBudget")
     budget.name            = f"{name} Budget"
@@ -331,7 +328,6 @@ def tool_create_search_campaign(name: str,
         customer_id=CUSTOMER_ID, operations=[budget_op])
     budget_rn = budget_res.results[0].resource_name
 
-    # 2. Create campaign
     camp_svc = client.get_service("CampaignService")
     campaign = client.get_type("Campaign")
     campaign.name                   = name
@@ -366,7 +362,6 @@ def tool_create_search_campaign(name: str,
 def tool_create_ad_group(campaign_name: str,
                          ad_group_name: str,
                          cpc_bid_gbp: float) -> str:
-    """Create an ad group inside an existing campaign."""
     rows = run_query(f"""
         SELECT campaign.resource_name
         FROM campaign
@@ -403,10 +398,6 @@ def tool_create_responsive_search_ad(campaign_name: str,
                                      headlines: list,
                                      descriptions: list,
                                      final_url: str) -> str:
-    """
-    Create a Responsive Search Ad. Requires 3–15 headlines and 2–4 descriptions.
-    Headlines max 30 chars each; descriptions max 90 chars each.
-    """
     if len(headlines) < 3 or len(headlines) > 15:
         return json.dumps({"error": "Provide 3–15 headlines"})
     if len(descriptions) < 2 or len(descriptions) > 4:
@@ -418,7 +409,6 @@ def tool_create_responsive_search_ad(campaign_name: str,
         bad = [d for d in descriptions if len(d) > 90]
         return json.dumps({"error": f"Descriptions over 90 chars: {bad}"})
 
-    # Look up ad group resource name
     rows = run_query(f"""
         SELECT ad_group.resource_name
         FROM ad_group
@@ -467,10 +457,6 @@ def tool_create_responsive_search_ad(campaign_name: str,
 def tool_add_keywords_to_ad_group(campaign_name: str,
                                    ad_group_name: str,
                                    keywords: list) -> str:
-    """
-    Add keywords to an ad group. Each keyword is an object with:
-      text (str), match_type (BROAD | PHRASE | EXACT), cpc_bid_gbp (optional float)
-    """
     rows = run_query(f"""
         SELECT ad_group.resource_name
         FROM ad_group
@@ -519,174 +505,126 @@ def tool_add_keywords_to_ad_group(campaign_name: str,
     })
 
 
-# ── MCP server ────────────────────────────────────────────────────────────────
+# ── MCP Server (mcp 2.x) ─────────────────────────────────────────────────────
 
-server = Server("bpd-google-ads")
-
-TOOLS = [
-    Tool(name="get_account_overview",
-         description="Overall account metrics: spend, clicks, impressions, conversions, ROAS.",
-         inputSchema={"type":"object","properties":{
-             "days":{"type":"integer","description":"Days back from today (default 30)"}}}),
-    Tool(name="get_campaigns",
-         description="List all campaigns with status, type and daily budget.",
-         inputSchema={"type":"object","properties":{}}),
-    Tool(name="get_performance",
-         description="Campaign-level spend, clicks, impressions, CTR and conversions.",
-         inputSchema={"type":"object","properties":{
-             "days":{"type":"integer","description":"Days back (default 30)"},
-             "start":{"type":"string","description":"Start date YYYY-MM-DD"},
-             "end":{"type":"string","description":"End date YYYY-MM-DD"}}}),
-    Tool(name="get_search_terms",
-         description="Top search terms by spend with clicks and conversions.",
-         inputSchema={"type":"object","properties":{
-             "days":{"type":"integer","description":"Days back (default 30)"}}}),
-    Tool(name="get_keywords",
-         description="Keywords with performance metrics, optionally filtered by campaign.",
-         inputSchema={"type":"object","properties":{
-             "campaign_name":{"type":"string","description":"Filter by campaign (optional)"},
-             "days":{"type":"integer","description":"Days back (default 30)"}}}),
-    Tool(name="get_ad_groups",
-         description="List ad groups, optionally filtered by campaign.",
-         inputSchema={"type":"object","properties":{
-             "campaign_name":{"type":"string","description":"Campaign name (optional)"}}}),
-    Tool(name="update_campaign_budget",
-         description="Change a campaign's daily budget in GBP.",
-         inputSchema={"type":"object","required":["campaign_name","new_daily_budget_gbp"],
-                      "properties":{
-             "campaign_name":{"type":"string"},
-             "new_daily_budget_gbp":{"type":"number","description":"New daily budget in £"}}}),
-    Tool(name="set_campaign_status",
-         description="Enable or pause a campaign.",
-         inputSchema={"type":"object","required":["campaign_name","status"],
-                      "properties":{
-             "campaign_name":{"type":"string"},
-             "status":{"type":"string","enum":["ENABLED","PAUSED"]}}}),
-    Tool(name="add_negative_keywords",
-         description="Add broad-match negative keywords to a campaign.",
-         inputSchema={"type":"object","required":["campaign_name","keywords"],
-                      "properties":{
-             "campaign_name":{"type":"string"},
-             "keywords":{"type":"array","items":{"type":"string"}}}}),
-    Tool(name="create_search_campaign",
-         description="Create a new Google Search campaign with a daily budget. Starts PAUSED by default so you can add ad groups and ads before enabling.",
-         inputSchema={"type":"object","required":["name","daily_budget_gbp"],
-                      "properties":{
-             "name":{"type":"string","description":"Campaign name"},
-             "daily_budget_gbp":{"type":"number","description":"Daily budget in £"},
-             "start_paused":{"type":"boolean","description":"Start paused (default true)"}}}),
-    Tool(name="create_ad_group",
-         description="Create an ad group inside an existing campaign.",
-         inputSchema={"type":"object","required":["campaign_name","ad_group_name","cpc_bid_gbp"],
-                      "properties":{
-             "campaign_name":{"type":"string"},
-             "ad_group_name":{"type":"string"},
-             "cpc_bid_gbp":{"type":"number","description":"Max CPC bid in £"}}}),
-    Tool(name="create_responsive_search_ad",
-         description="Create a Responsive Search Ad in an ad group. Provide 3–15 headlines (max 30 chars each) and 2–4 descriptions (max 90 chars each).",
-         inputSchema={"type":"object","required":["campaign_name","ad_group_name","headlines","descriptions","final_url"],
-                      "properties":{
-             "campaign_name":{"type":"string"},
-             "ad_group_name":{"type":"string"},
-             "headlines":{"type":"array","items":{"type":"string"},"description":"3–15 headlines, max 30 chars each"},
-             "descriptions":{"type":"array","items":{"type":"string"},"description":"2–4 descriptions, max 90 chars each"},
-             "final_url":{"type":"string","description":"Landing page URL"}}}),
-    Tool(name="add_keywords_to_ad_group",
-         description="Add keywords to an ad group. Each keyword needs text, match_type (BROAD/PHRASE/EXACT), and optional cpc_bid_gbp.",
-         inputSchema={"type":"object","required":["campaign_name","ad_group_name","keywords"],
-                      "properties":{
-             "campaign_name":{"type":"string"},
-             "ad_group_name":{"type":"string"},
-             "keywords":{"type":"array","items":{
-                 "type":"object","required":["text","match_type"],
-                 "properties":{
-                     "text":{"type":"string"},
-                     "match_type":{"type":"string","enum":["BROAD","PHRASE","EXACT"]},
-                     "cpc_bid_gbp":{"type":"number","description":"Optional keyword-level bid in £"}}}}}}),
-]
+mcp = MCPServer("bpd-google-ads")
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    return TOOLS
-
-
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+def _safe(fn, *args, **kwargs) -> str:
     try:
-        match name:
-            case "get_account_overview":
-                result = tool_get_account_overview(arguments.get("days", 30))
-            case "get_campaigns":
-                result = tool_get_campaigns()
-            case "get_performance":
-                result = tool_get_performance(
-                    arguments.get("days", 30),
-                    arguments.get("start"), arguments.get("end"))
-            case "get_search_terms":
-                result = tool_get_search_terms(arguments.get("days", 30))
-            case "get_keywords":
-                result = tool_get_keywords(
-                    arguments.get("campaign_name"), arguments.get("days", 30))
-            case "get_ad_groups":
-                result = tool_get_ad_groups(arguments.get("campaign_name"))
-            case "update_campaign_budget":
-                result = tool_update_campaign_budget(
-                    arguments["campaign_name"], arguments["new_daily_budget_gbp"])
-            case "set_campaign_status":
-                result = tool_set_campaign_status(
-                    arguments["campaign_name"], arguments["status"])
-            case "add_negative_keywords":
-                result = tool_add_negative_keywords(
-                    arguments["campaign_name"], arguments["keywords"])
-            case "create_search_campaign":
-                result = tool_create_search_campaign(
-                    arguments["name"], arguments["daily_budget_gbp"],
-                    arguments.get("start_paused", True))
-            case "create_ad_group":
-                result = tool_create_ad_group(
-                    arguments["campaign_name"], arguments["ad_group_name"],
-                    arguments["cpc_bid_gbp"])
-            case "create_responsive_search_ad":
-                result = tool_create_responsive_search_ad(
-                    arguments["campaign_name"], arguments["ad_group_name"],
-                    arguments["headlines"], arguments["descriptions"],
-                    arguments["final_url"])
-            case "add_keywords_to_ad_group":
-                result = tool_add_keywords_to_ad_group(
-                    arguments["campaign_name"], arguments["ad_group_name"],
-                    arguments["keywords"])
-            case _:
-                result = json.dumps({"error": f"Unknown tool: {name}"})
+        return fn(*args, **kwargs)
     except GoogleAdsException as e:
         errors = [str(err.message) for err in e.failure.errors]
-        result = json.dumps({"error": "Google Ads API error", "details": errors})
+        return json.dumps({"error": "Google Ads API error", "details": errors})
     except Exception as e:
-        result = json.dumps({"error": str(e)})
-    return [TextContent(type="text", text=result)]
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_account_overview(days: int = 30) -> str:
+    """Overall account metrics: spend, clicks, impressions, conversions, ROAS."""
+    return _safe(tool_get_account_overview, days)
+
+
+@mcp.tool()
+def get_campaigns() -> str:
+    """List all campaigns with status, type and daily budget."""
+    return _safe(tool_get_campaigns)
+
+
+@mcp.tool()
+def get_performance(days: int = 30, start: str = "", end: str = "") -> str:
+    """Campaign-level spend, clicks, impressions, CTR and conversions."""
+    return _safe(tool_get_performance, days, start or None, end or None)
+
+
+@mcp.tool()
+def get_search_terms(days: int = 30) -> str:
+    """Top 50 search terms by spend with clicks and conversions."""
+    return _safe(tool_get_search_terms, days)
+
+
+@mcp.tool()
+def get_keywords(campaign_name: str = "", days: int = 30) -> str:
+    """Keywords with performance metrics, optionally filtered by campaign name."""
+    return _safe(tool_get_keywords, campaign_name or None, days)
+
+
+@mcp.tool()
+def get_ad_groups(campaign_name: str = "") -> str:
+    """List ad groups, optionally filtered by campaign name."""
+    return _safe(tool_get_ad_groups, campaign_name or None)
+
+
+@mcp.tool()
+def update_campaign_budget(campaign_name: str, new_daily_budget_gbp: float) -> str:
+    """Change a campaign's daily budget in GBP."""
+    return _safe(tool_update_campaign_budget, campaign_name, new_daily_budget_gbp)
+
+
+@mcp.tool()
+def set_campaign_status(campaign_name: str, status: str) -> str:
+    """Enable or pause a campaign. status must be ENABLED or PAUSED."""
+    return _safe(tool_set_campaign_status, campaign_name, status)
+
+
+@mcp.tool()
+def add_negative_keywords(campaign_name: str, keywords: list[str]) -> str:
+    """Add broad-match negative keywords to a campaign."""
+    return _safe(tool_add_negative_keywords, campaign_name, keywords)
+
+
+@mcp.tool()
+def create_search_campaign(name: str, daily_budget_gbp: float,
+                            start_paused: bool = True) -> str:
+    """Create a new Google Search campaign. Starts paused by default so ads can be added before going live."""
+    return _safe(tool_create_search_campaign, name, daily_budget_gbp, start_paused)
+
+
+@mcp.tool()
+def create_ad_group(campaign_name: str, ad_group_name: str,
+                    cpc_bid_gbp: float) -> str:
+    """Create an ad group inside an existing campaign with a max CPC bid in GBP."""
+    return _safe(tool_create_ad_group, campaign_name, ad_group_name, cpc_bid_gbp)
+
+
+@mcp.tool()
+def create_responsive_search_ad(campaign_name: str, ad_group_name: str,
+                                 headlines: list[str], descriptions: list[str],
+                                 final_url: str) -> str:
+    """Create a Responsive Search Ad. Requires 3-15 headlines (max 30 chars each) and 2-4 descriptions (max 90 chars each)."""
+    return _safe(tool_create_responsive_search_ad,
+                 campaign_name, ad_group_name, headlines, descriptions, final_url)
+
+
+@mcp.tool()
+def add_keywords_to_ad_group(campaign_name: str, ad_group_name: str,
+                              keywords: list) -> str:
+    """Add keywords to an ad group. Each keyword: {text, match_type (BROAD/PHRASE/EXACT), cpc_bid_gbp (optional)}."""
+    return _safe(tool_add_keywords_to_ad_group,
+                 campaign_name, ad_group_name, keywords)
+
+
+# ── Auth middleware ───────────────────────────────────────────────────────────
+
+class TokenAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        # Always allow health checks
+        if path in ("/", "/health"):
+            return await call_next(request)
+        # Allow requests continuing an established MCP session
+        if "mcp-session-id" in request.headers:
+            return await call_next(request)
+        # Require token for new connections
+        if request.query_params.get("token") != AUTH_TOKEN:
+            return Response("Unauthorized", status_code=401)
+        return await call_next(request)
 
 
 # ── Starlette app ─────────────────────────────────────────────────────────────
 
-sse = SseServerTransport("/messages/")
-
-
-async def handle_sse(request):
-    if request.query_params.get("token") != AUTH_TOKEN:
-        return Response("Unauthorized", status_code=401)
-    if request.method == "POST":
-        return Response(status_code=200)
-    async with sse.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
-        await server.run(streams[0], streams[1],
-                         server.create_initialization_options())
-
-
-async def handle_messages(request):
-    if request.query_params.get("token") != AUTH_TOKEN:
-        return Response("Unauthorized", status_code=401)
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+_mcp_asgi = mcp.streamable_http_app(streamable_http_path="/mcp")
 
 
 async def health(request):
@@ -694,13 +632,12 @@ async def health(request):
 
 
 starlette_app = Starlette(routes=[
-    Route("/",         endpoint=health),
-    Route("/health",   endpoint=health),
-    Route("/sse",      endpoint=handle_sse, methods=["GET", "POST"]),
-    Route("/messages/", endpoint=handle_messages, methods=["POST"]),
-    Mount("/messages", app=sse.handle_post_message),
+    Route("/",       endpoint=health),
+    Route("/health", endpoint=health),
+    Mount("/",       app=_mcp_asgi),
 ])
 
+starlette_app.add_middleware(TokenAuthMiddleware)
 starlette_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
