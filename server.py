@@ -313,6 +313,212 @@ def tool_add_negative_keywords(campaign_name: str,
                        "added_negatives": keywords})
 
 
+def tool_create_search_campaign(name: str,
+                                daily_budget_gbp: float,
+                                start_paused: bool = True) -> str:
+    """Create a Search campaign with a standard budget. Returns campaign resource name."""
+    client = ads_client()
+
+    # 1. Create budget
+    budget_svc = client.get_service("CampaignBudgetService")
+    budget     = client.get_type("CampaignBudget")
+    budget.name            = f"{name} Budget"
+    budget.amount_micros   = int(daily_budget_gbp * 1_000_000)
+    budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    budget_op = client.get_type("CampaignBudgetOperation")
+    budget_op.create.CopyFrom(budget)
+    budget_res = budget_svc.mutate_campaign_budgets(
+        customer_id=CUSTOMER_ID, operations=[budget_op])
+    budget_rn = budget_res.results[0].resource_name
+
+    # 2. Create campaign
+    camp_svc = client.get_service("CampaignService")
+    campaign = client.get_type("Campaign")
+    campaign.name                   = name
+    campaign.campaign_budget        = budget_rn
+    campaign.advertising_channel_type = (
+        client.enums.AdvertisingChannelTypeEnum.SEARCH)
+    campaign.status = (
+        client.enums.CampaignStatusEnum.PAUSED if start_paused
+        else client.enums.CampaignStatusEnum.ENABLED)
+    campaign.manual_cpc.enhanced_cpc_enabled = False
+    campaign.network_settings.target_google_search  = True
+    campaign.network_settings.target_search_network = False
+    campaign.network_settings.target_content_network = False
+    campaign.start_date = datetime.date.today().strftime("%Y%m%d")
+
+    camp_op = client.get_type("CampaignOperation")
+    camp_op.create.CopyFrom(campaign)
+    camp_res = camp_svc.mutate_campaigns(
+        customer_id=CUSTOMER_ID, operations=[camp_op])
+    camp_rn = camp_res.results[0].resource_name
+
+    return json.dumps({
+        "success":           True,
+        "campaign_name":     name,
+        "resource_name":     camp_rn,
+        "daily_budget_gbp":  daily_budget_gbp,
+        "status":            "PAUSED" if start_paused else "ENABLED",
+        "note": "Add ad groups and ads before enabling.",
+    })
+
+
+def tool_create_ad_group(campaign_name: str,
+                         ad_group_name: str,
+                         cpc_bid_gbp: float) -> str:
+    """Create an ad group inside an existing campaign."""
+    rows = run_query(f"""
+        SELECT campaign.resource_name
+        FROM campaign
+        WHERE campaign.name = '{campaign_name}'
+        LIMIT 1
+    """)
+    if not rows:
+        return json.dumps({"error": f"Campaign '{campaign_name}' not found"})
+
+    client   = ads_client()
+    service  = client.get_service("AdGroupService")
+    ad_group = client.get_type("AdGroup")
+    ad_group.name            = ad_group_name
+    ad_group.campaign        = rows[0].campaign.resource_name
+    ad_group.type_           = client.enums.AdGroupTypeEnum.SEARCH_STANDARD
+    ad_group.cpc_bid_micros  = int(cpc_bid_gbp * 1_000_000)
+    ad_group.status          = client.enums.AdGroupStatusEnum.ENABLED
+
+    op = client.get_type("AdGroupOperation")
+    op.create.CopyFrom(ad_group)
+    res = service.mutate_ad_groups(customer_id=CUSTOMER_ID, operations=[op])
+
+    return json.dumps({
+        "success":       True,
+        "campaign":      campaign_name,
+        "ad_group":      ad_group_name,
+        "resource_name": res.results[0].resource_name,
+        "cpc_bid_gbp":   cpc_bid_gbp,
+    })
+
+
+def tool_create_responsive_search_ad(campaign_name: str,
+                                     ad_group_name: str,
+                                     headlines: list,
+                                     descriptions: list,
+                                     final_url: str) -> str:
+    """
+    Create a Responsive Search Ad. Requires 3–15 headlines and 2–4 descriptions.
+    Headlines max 30 chars each; descriptions max 90 chars each.
+    """
+    if len(headlines) < 3 or len(headlines) > 15:
+        return json.dumps({"error": "Provide 3–15 headlines"})
+    if len(descriptions) < 2 or len(descriptions) > 4:
+        return json.dumps({"error": "Provide 2–4 descriptions"})
+    if any(len(h) > 30 for h in headlines):
+        bad = [h for h in headlines if len(h) > 30]
+        return json.dumps({"error": f"Headlines over 30 chars: {bad}"})
+    if any(len(d) > 90 for d in descriptions):
+        bad = [d for d in descriptions if len(d) > 90]
+        return json.dumps({"error": f"Descriptions over 90 chars: {bad}"})
+
+    # Look up ad group resource name
+    rows = run_query(f"""
+        SELECT ad_group.resource_name
+        FROM ad_group
+        WHERE ad_group.name = '{ad_group_name}'
+          AND campaign.name = '{campaign_name}'
+        LIMIT 1
+    """)
+    if not rows:
+        return json.dumps({"error": f"Ad group '{ad_group_name}' not found in '{campaign_name}'"})
+
+    client  = ads_client()
+    service = client.get_service("AdGroupAdService")
+
+    ad_group_ad          = client.get_type("AdGroupAd")
+    ad_group_ad.ad_group = rows[0].ad_group.resource_name
+    ad_group_ad.status   = client.enums.AdGroupAdStatusEnum.ENABLED
+
+    ad = ad_group_ad.ad
+    ad.final_urls.append(final_url)
+
+    rsa = ad.responsive_search_ad
+    for text in headlines:
+        asset      = client.get_type("AdTextAsset")
+        asset.text = text
+        rsa.headlines.append(asset)
+    for text in descriptions:
+        asset      = client.get_type("AdTextAsset")
+        asset.text = text
+        rsa.descriptions.append(asset)
+
+    op = client.get_type("AdGroupAdOperation")
+    op.create.CopyFrom(ad_group_ad)
+    res = service.mutate_ad_group_ads(customer_id=CUSTOMER_ID, operations=[op])
+
+    return json.dumps({
+        "success":       True,
+        "campaign":      campaign_name,
+        "ad_group":      ad_group_name,
+        "resource_name": res.results[0].resource_name,
+        "headlines":     headlines,
+        "descriptions":  descriptions,
+        "final_url":     final_url,
+    })
+
+
+def tool_add_keywords_to_ad_group(campaign_name: str,
+                                   ad_group_name: str,
+                                   keywords: list) -> str:
+    """
+    Add keywords to an ad group. Each keyword is an object with:
+      text (str), match_type (BROAD | PHRASE | EXACT), cpc_bid_gbp (optional float)
+    """
+    rows = run_query(f"""
+        SELECT ad_group.resource_name
+        FROM ad_group
+        WHERE ad_group.name = '{ad_group_name}'
+          AND campaign.name = '{campaign_name}'
+        LIMIT 1
+    """)
+    if not rows:
+        return json.dumps({"error": f"Ad group '{ad_group_name}' not found in '{campaign_name}'"})
+
+    ad_group_rn = rows[0].ad_group.resource_name
+    client      = ads_client()
+    service     = client.get_service("AdGroupCriterionService")
+
+    match_map = {
+        "EXACT":  client.enums.KeywordMatchTypeEnum.EXACT,
+        "PHRASE": client.enums.KeywordMatchTypeEnum.PHRASE,
+        "BROAD":  client.enums.KeywordMatchTypeEnum.BROAD,
+    }
+
+    ops = []
+    for kw in keywords:
+        criterion             = client.get_type("AdGroupCriterion")
+        criterion.ad_group    = ad_group_rn
+        criterion.status      = client.enums.AdGroupCriterionStatusEnum.ENABLED
+        criterion.keyword.text       = kw["text"].lower().strip()
+        criterion.keyword.match_type = match_map.get(
+            kw.get("match_type", "BROAD").upper(),
+            client.enums.KeywordMatchTypeEnum.BROAD)
+        if kw.get("cpc_bid_gbp"):
+            criterion.cpc_bid_micros = int(kw["cpc_bid_gbp"] * 1_000_000)
+        op = client.get_type("AdGroupCriterionOperation")
+        op.create.CopyFrom(criterion)
+        ops.append(op)
+
+    service.mutate_ad_group_criteria(customer_id=CUSTOMER_ID, operations=ops)
+
+    return json.dumps({
+        "success":    True,
+        "campaign":   campaign_name,
+        "ad_group":   ad_group_name,
+        "added":      len(ops),
+        "keywords":   [{"text": kw["text"],
+                         "match_type": kw.get("match_type", "BROAD")}
+                        for kw in keywords],
+    })
+
+
 # ── MCP server ────────────────────────────────────────────────────────────────
 
 server = Server("bpd-google-ads")
@@ -362,6 +568,41 @@ TOOLS = [
                       "properties":{
              "campaign_name":{"type":"string"},
              "keywords":{"type":"array","items":{"type":"string"}}}}),
+    Tool(name="create_search_campaign",
+         description="Create a new Google Search campaign with a daily budget. Starts PAUSED by default so you can add ad groups and ads before enabling.",
+         inputSchema={"type":"object","required":["name","daily_budget_gbp"],
+                      "properties":{
+             "name":{"type":"string","description":"Campaign name"},
+             "daily_budget_gbp":{"type":"number","description":"Daily budget in £"},
+             "start_paused":{"type":"boolean","description":"Start paused (default true)"}}}),
+    Tool(name="create_ad_group",
+         description="Create an ad group inside an existing campaign.",
+         inputSchema={"type":"object","required":["campaign_name","ad_group_name","cpc_bid_gbp"],
+                      "properties":{
+             "campaign_name":{"type":"string"},
+             "ad_group_name":{"type":"string"},
+             "cpc_bid_gbp":{"type":"number","description":"Max CPC bid in £"}}}),
+    Tool(name="create_responsive_search_ad",
+         description="Create a Responsive Search Ad in an ad group. Provide 3–15 headlines (max 30 chars each) and 2–4 descriptions (max 90 chars each).",
+         inputSchema={"type":"object","required":["campaign_name","ad_group_name","headlines","descriptions","final_url"],
+                      "properties":{
+             "campaign_name":{"type":"string"},
+             "ad_group_name":{"type":"string"},
+             "headlines":{"type":"array","items":{"type":"string"},"description":"3–15 headlines, max 30 chars each"},
+             "descriptions":{"type":"array","items":{"type":"string"},"description":"2–4 descriptions, max 90 chars each"},
+             "final_url":{"type":"string","description":"Landing page URL"}}}),
+    Tool(name="add_keywords_to_ad_group",
+         description="Add keywords to an ad group. Each keyword needs text, match_type (BROAD/PHRASE/EXACT), and optional cpc_bid_gbp.",
+         inputSchema={"type":"object","required":["campaign_name","ad_group_name","keywords"],
+                      "properties":{
+             "campaign_name":{"type":"string"},
+             "ad_group_name":{"type":"string"},
+             "keywords":{"type":"array","items":{
+                 "type":"object","required":["text","match_type"],
+                 "properties":{
+                     "text":{"type":"string"},
+                     "match_type":{"type":"string","enum":["BROAD","PHRASE","EXACT"]},
+                     "cpc_bid_gbp":{"type":"number","description":"Optional keyword-level bid in £"}}}}}}),
 ]
 
 
@@ -398,6 +639,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             case "add_negative_keywords":
                 result = tool_add_negative_keywords(
                     arguments["campaign_name"], arguments["keywords"])
+            case "create_search_campaign":
+                result = tool_create_search_campaign(
+                    arguments["name"], arguments["daily_budget_gbp"],
+                    arguments.get("start_paused", True))
+            case "create_ad_group":
+                result = tool_create_ad_group(
+                    arguments["campaign_name"], arguments["ad_group_name"],
+                    arguments["cpc_bid_gbp"])
+            case "create_responsive_search_ad":
+                result = tool_create_responsive_search_ad(
+                    arguments["campaign_name"], arguments["ad_group_name"],
+                    arguments["headlines"], arguments["descriptions"],
+                    arguments["final_url"])
+            case "add_keywords_to_ad_group":
+                result = tool_add_keywords_to_ad_group(
+                    arguments["campaign_name"], arguments["ad_group_name"],
+                    arguments["keywords"])
             case _:
                 result = json.dumps({"error": f"Unknown tool: {name}"})
     except GoogleAdsException as e:
