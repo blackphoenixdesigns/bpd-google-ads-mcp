@@ -306,7 +306,7 @@ def tool_add_negative_keywords(campaign_name: str, keywords: list) -> str:
         criterion.keyword.match_type = (
             client.enums.KeywordMatchTypeEnum.BROAD)
         op = client.get_type("CampaignCriterionOperation")
-        op.create.CopyFrom(criterion)
+        op.create = criterion
         ops.append(op)
     service.mutate_campaign_criteria(customer_id=CUSTOMER_ID, operations=ops)
     return json.dumps({"success": True, "campaign": campaign_name,
@@ -324,7 +324,7 @@ def tool_create_search_campaign(name: str,
     budget.amount_micros   = int(daily_budget_gbp * 1_000_000)
     budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
     budget_op = client.get_type("CampaignBudgetOperation")
-    budget_op.create.CopyFrom(budget)
+    budget_op.create = budget
     budget_res = budget_svc.mutate_campaign_budgets(
         customer_id=CUSTOMER_ID, operations=[budget_op])
     budget_rn = budget_res.results[0].resource_name
@@ -345,7 +345,7 @@ def tool_create_search_campaign(name: str,
     campaign.start_date = datetime.date.today().strftime("%Y%m%d")
 
     camp_op = client.get_type("CampaignOperation")
-    camp_op.create.CopyFrom(campaign)
+    camp_op.create = campaign
     camp_res = camp_svc.mutate_campaigns(
         customer_id=CUSTOMER_ID, operations=[camp_op])
     camp_rn = camp_res.results[0].resource_name
@@ -382,7 +382,7 @@ def tool_create_ad_group(campaign_name: str,
     ad_group.status          = client.enums.AdGroupStatusEnum.ENABLED
 
     op = client.get_type("AdGroupOperation")
-    op.create.CopyFrom(ad_group)
+    op.create = ad_group
     res = service.mutate_ad_groups(customer_id=CUSTOMER_ID, operations=[op])
 
     return json.dumps({
@@ -441,7 +441,7 @@ def tool_create_responsive_search_ad(campaign_name: str,
         rsa.descriptions.append(asset)
 
     op = client.get_type("AdGroupAdOperation")
-    op.create.CopyFrom(ad_group_ad)
+    op.create = ad_group_ad
     res = service.mutate_ad_group_ads(customer_id=CUSTOMER_ID, operations=[op])
 
     return json.dumps({
@@ -490,7 +490,7 @@ def tool_add_keywords_to_ad_group(campaign_name: str,
         if kw.get("cpc_bid_gbp"):
             criterion.cpc_bid_micros = int(kw["cpc_bid_gbp"] * 1_000_000)
         op = client.get_type("AdGroupCriterionOperation")
-        op.create.CopyFrom(criterion)
+        op.create = criterion
         ops.append(op)
 
     service.mutate_ad_group_criteria(customer_id=CUSTOMER_ID, operations=ops)
