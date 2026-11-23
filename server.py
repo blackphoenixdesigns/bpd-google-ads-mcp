@@ -304,7 +304,7 @@ def tool_add_negative_keywords(campaign_name: str, keywords: list) -> str:
         criterion.negative       = True
         criterion.keyword.text   = kw.lower().strip()
         criterion.keyword.match_type = (
-            client.enums.KeywordMatchTypeEnum.KeywordMatchType.BROAD)
+            client.enums.KeywordMatchTypeEnum.BROAD)
         op = client.get_type("CampaignCriterionOperation")
         op.create.CopyFrom(criterion)
         ops.append(op)
